@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>micro:bit 雙螺旋槳控制</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    text-align: center;
+    background-color: #f4f4f9;
+    margin: 0;
+    padding: 20px;
+    /* 避免在手機版拖拉滑動條時觸發頁面滾動 */
+    touch-action: none; 
+  }
+  h1 { font-size: 24px; color: #333; }
+  .controls { margin-bottom: 20px; }
+  button {
+    font-size: 16px;
+    padding: 10px 20px;
+    margin: 5px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    background-color: #007BFF;
+    color: white;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+  }
+  button:active { background-color: #0056b3; }
+  
+  #status { 
+    padding: 10px; 
+    border-radius: 6px; 
+    margin: 10px auto; 
+    max-width: 400px;
+    font-weight: bold;
+  }
+  .success { background: #e6ffed; color: #28A745; border: 1px solid #28A745;}
+  .error   { background: #ffe6e6; color: #DC3545; border: 1px solid #DC3545;}
+
+  /* 滑動條排版 */
+  .sliders-container {
+    display: flex;
+    justify-content: space-around;
+    align-items: center;
+    margin-top: 30px;
+    max-width: 600px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+  .slider-wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    background: #fff;
+    padding: 20px;
+    border-radius: 12px;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.05);
+    width: 120px;
+  }
+  .slider-wrapper h2 {
+    margin: 0 0 15px 0;
+    font-size: 18px;
+  }
+  /* 垂直滑動條樣式 */
+  input[type=range].vertical {
+    -webkit-appearance: slider-vertical; /* WebKit */
+    writing-mode: bt-lr; /* IE/Edge */
+    width: 40px;
+    height: 250px;
+    margin: 10px 0;
+    cursor: pointer;
+  }
+  .data-label {
+    margin-top: 10px;
+    font-size: 16px;
+    color: #555;
+  }
+  .current-val {
+    font-size: 22px;
+    font-weight: bold;
+    color: #007BFF;
+    margin-top: 5px;
+  }
+</style>
+</head>
+<body>
+
+<h1>micro:bit 螺旋槳控制器</h1>
+
+<div class="controls">
+  <button id="connectBluetooth">連線 micro:bit (藍牙)</button>
+  <button id="connectUSB">連線 micro:bit (USB)</button>
+</div>
+<div id="status">尚未連線</div>
+
+<div class="sliders-container">
+  <!-- 左螺旋槳 -->
+  <div class="slider-wrapper">
+    <h2>左螺旋槳</h2>
+    <input type="range" id="sliderL" class="vertical" min="-100" max="100" value="0">
+    <div class="data-label" id="targetL_label">目標: 0</div>
+    <div class="current-val" id="currentL_label">當前: 0</div>
+  </div>
+
+  <!-- 右螺旋槳 -->
+  <div class="slider-wrapper">
+    <h2>右螺旋槳</h2>
+    <input type="range" id="sliderR" class="vertical" min="-100" max="100" value="0">
+    <div class="data-label" id="targetR_label">目標: 0</div>
+    <div class="current-val" id="currentR_label">當前: 0</div>
+  </div>
+</div>
+
+<script>
+/* ==================== micro:bit 通訊 ==================== */
+
+const UART_SERVICE_UUID         = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const UART_TX_CHARACTERISTIC_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; 
+const UART_RX_CHARACTERISTIC_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; 
+
+let uBitDevice = null;         
+let rxCharacteristic = null;   
+let serialPort = null;         
+const onMicrobitReceive = new EventTarget();
+
+function setStatus(msg, isError = false) {
+  const el = document.getElementById("status");
+  el.textContent = msg;
+  el.className = isError ? "error" : "success";
+}
+
+async function connectBluetooth() {
+  try {
+    setStatus("正在搜尋 micro:bit (藍牙)...");
+    uBitDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: "BBC micro:bit" }],
+      optionalServices: [UART_SERVICE_UUID]
+    });
+
+    uBitDevice.addEventListener("gattserverdisconnected", onBluetoothDisconnected);
+    const server = await uBitDevice.gatt.connect();
+    const service = await server.getPrimaryService(UART_SERVICE_UUID);
+    
+    const txChar = await service.getCharacteristic(UART_TX_CHARACTERISTIC_UUID);
+    await txChar.startNotifications();
+    txChar.addEventListener("characteristicvaluechanged", handleBluetoothData);
+    
+    rxCharacteristic = await service.getCharacteristic(UART_RX_CHARACTERISTIC_UUID);
+    setStatus("✅ 藍牙已成功連接到 micro:bit", false);
+  } catch (err) {
+    setStatus("❌ 藍牙連接失敗: " + err.message, true);
+    console.error(err);
+  }
+}
+
+function onBluetoothDisconnected() {
+  setStatus("⚠️ micro:bit 藍牙已斷線", true);
+  uBitDevice = null;
+  rxCharacteristic = null;
+}
+
+function handleBluetoothData(event) {
+  const value = event.target.value;
+  const text = new TextDecoder().decode(value).trim();
+  if (text) {
+    onMicrobitReceive.dispatchEvent(new CustomEvent("data", { detail: text }));
+  }
+}
+
+async function connectUSB() {
+  try {
+    setStatus("請選擇 micro:bit 的序列埠 (USB)...");
+    serialPort = await navigator.serial.requestPort();
+    await serialPort.open({ baudRate: 115200 });
+
+    setStatus("✅ USB 已成功連接到 micro:bit", false);
+    
+    const reader = serialPort.readable.getReader();
+    const decoder = new TextDecoder();
+    let buffer = ""; 
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let lines = buffer.split("\n");
+      buffer = lines.pop(); 
+      for (let line of lines) {
+        line = line.trim();
+        if (line) {
+          onMicrobitReceive.dispatchEvent(new CustomEvent("data", { detail: line }));
+        }
+      }
+    }
+  } catch (err) {
+    setStatus("❌ USB 連接失敗: " + err.message, true);
+    console.error(err);
+  }
+}
+
+async function sendToMicrobit(message) {
+  const data = message + "\n"; 
+  const encoder = new TextEncoder();
+
+  try {
+    if (serialPort?.writable) {
+      const writer = serialPort.writable.getWriter();
+      await writer.write(encoder.encode(data));
+      writer.releaseLock();
+      return;
+    }
+    if (rxCharacteristic) {
+      await rxCharacteristic.writeValue(encoder.encode(data));
+      return;
+    }
+  } catch (err) {
+    console.error("發送失敗:", err);
+  }
+}
+
+document.getElementById("connectBluetooth").addEventListener("click", connectBluetooth);
+document.getElementById("connectUSB").addEventListener("click", connectUSB);
+
+
+/* ==================== 螺旋槳漸進加速邏輯 ==================== */
+
+let targetL = 0, targetR = 0;       
+let currentL = 0, currentR = 0;     
+const accelStep = 2;                
+const updateInterval = 50;          
+
+// 監聽左滑動條變化
+document.getElementById("sliderL").addEventListener("input", function(e) {
+  targetL = parseInt(e.target.value);
+  document.getElementById("targetL_label").innerText = "目標: " + targetL;
+});
+
+// 監聽右滑動條變化
+document.getElementById("sliderR").addEventListener("input", function(e) {
+  targetR = parseInt(e.target.value);
+  document.getElementById("targetR_label").innerText = "目標: " + targetR;
+});
+
+// 定時器：讓 current 值逐漸靠近 target 值，並傳送至 micro:bit
+setInterval(() => {
+  let changed = false;
+  
+  // 處理左螺旋槳漸進
+  if (currentL !== targetL) {
+    if (Math.abs(targetL - currentL) <= accelStep) {
+      currentL = targetL;
+    } else {
+      currentL += (targetL > currentL) ? accelStep : -accelStep;
+    }
+    changed = true;
+  }
+  
+  // 處理右螺旋槳漸進
+  if (currentR !== targetR) {
+    if (Math.abs(targetR - currentR) <= accelStep) {
+      currentR = targetR;
+    } else {
+      currentR += (targetR > currentR) ? accelStep : -accelStep;
+    }
+    changed = true;
+  }
+  
+  // 如果數值有變動，發送純數字字串給 micro:bit
+  if (changed) {
+    document.getElementById("currentL_label").innerText = "當前: " + currentL;
+    document.getElementById("currentR_label").innerText = "當前: " + currentR;
+    
+    // 發送格式： "左數值,右數值" (例如 "50,-20")
+    sendToMicrobit(`${currentL},${currentR}`);
+  }
+}, updateInterval);
+
+</script>
+</body>
+</html>
